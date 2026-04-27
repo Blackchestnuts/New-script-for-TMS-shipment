@@ -955,7 +955,7 @@ def interactive_main():
     output_choice = input_with_default("  请选择", "1")
 
     db_create_table = False
-    db_truncate = False
+    db_on_conflict = 'update'
     db_dry_run = False
 
     if output_choice == "1":
@@ -982,8 +982,14 @@ def interactive_main():
         # 数据库操作选项
         if yes_no("  是否自动创建表（IF NOT EXISTS）?", "y"):
             db_create_table = True
-        if yes_no("  是否清空已有数据?", "n"):
-            db_truncate = True
+        print("  主键冲突时如何处理?")
+        print("    1. 更新（新数据覆盖旧值，默认）")
+        print("    2. 合并（新值非NULL时覆盖，NULL保留旧值）")
+        print("    3. 跳过（跳过冲突数据，仅插入新数据）")
+        print("    4. 报错（检测到冲突就终止）")
+        conflict_choice = input_with_default("  请选择", "1")
+        conflict_map = {"1": "update", "2": "merge", "3": "skip", "4": "error"}
+        db_on_conflict = conflict_map.get(conflict_choice, "update")
 
         # 保存数据库配置
         if not os.path.exists(DB_CONFIG_FILE):
@@ -1016,7 +1022,7 @@ def interactive_main():
         export_to_sql(shipments, items, output_dir)
     elif output_mode == "db":
         insert_to_mysql(shipments, items, db_host, db_port, db_user, db_pass, db_name,
-                        truncate=db_truncate, create_table=db_create_table, dry_run=db_dry_run)
+                        on_conflict=db_on_conflict, create_table=db_create_table, dry_run=db_dry_run)
 
     print("\n🎉 完成！")
 
@@ -1044,7 +1050,7 @@ def interactive_main_with_template(args, template):
     output_choice = input_with_default("  请选择", "1")
 
     db_create_table = False
-    db_truncate = False
+    db_on_conflict = 'update'
     db_dry_run = False
 
     if output_choice == "1":
@@ -1071,8 +1077,14 @@ def interactive_main_with_template(args, template):
         # 数据库操作选项
         if yes_no("  是否自动创建表（IF NOT EXISTS）?", "y"):
             db_create_table = True
-        if yes_no("  是否清空已有数据?", "n"):
-            db_truncate = True
+        print("  主键冲突时如何处理?")
+        print("    1. 更新（新数据覆盖旧值，默认）")
+        print("    2. 合并（新值非NULL时覆盖，NULL保留旧值）")
+        print("    3. 跳过（跳过冲突数据，仅插入新数据）")
+        print("    4. 报错（检测到冲突就终止）")
+        conflict_choice = input_with_default("  请选择", "1")
+        conflict_map = {"1": "update", "2": "merge", "3": "skip", "4": "error"}
+        db_on_conflict = conflict_map.get(conflict_choice, "update")
 
     # 生成
     print_title("开始生成数据")
@@ -1098,7 +1110,7 @@ def interactive_main_with_template(args, template):
         export_to_sql(shipments, items, output_dir)
     elif output_mode == "db":
         insert_to_mysql(shipments, items, db_host, db_port, db_user, db_pass, db_name,
-                        truncate=db_truncate, create_table=db_create_table, dry_run=db_dry_run)
+                        on_conflict=db_on_conflict, create_table=db_create_table, dry_run=db_dry_run)
 
     print("\n🎉 完成！")
 
@@ -1829,22 +1841,58 @@ def truncate_tables(host, port, user, password, database):
         return False
 
 
+def _check_existing_keys(cursor, table_name, pk_cols, new_keys):
+    """
+    查询数据库中已存在的主键，返回与新数据冲突的键集合。
+
+    Args:
+        cursor: 数据库游标
+        table_name: 表名
+        pk_cols: 主键列名列表，如 ['SHIPMENT_ID'] 或 ['SHIPMENT_ID', 'SELLER_SKU']
+        new_keys: 要插入的数据的主键值列表，每个元素是 tuple
+
+    Returns:
+        set: 已存在的主键值集合
+    """
+    if not new_keys:
+        return set()
+
+    existing = set()
+    # 分批查询，避免 IN 列表过长
+    batch = 500
+    for i in range(0, len(new_keys), batch):
+        chunk = new_keys[i:i + batch]
+        if len(pk_cols) == 1:
+            # 单主键
+            placeholders = ', '.join(['%s'] * len(chunk))
+            sql = f"SELECT `{pk_cols[0]}` FROM `{table_name}` WHERE `{pk_cols[0]}` IN ({placeholders})"
+            cursor.execute(sql, [k[0] for k in chunk])
+        else:
+            # 联合主键：逐条查询（简单实现，适合小批量）
+            for key_tuple in chunk:
+                where = ' AND '.join(f"`{col}` = %s" for col in pk_cols)
+                sql = f"SELECT 1 FROM `{table_name}` WHERE {where} LIMIT 1"
+                cursor.execute(sql, list(key_tuple))
+                if cursor.fetchone():
+                    existing.add(key_tuple)
+            continue
+        for row in cursor.fetchall():
+            if len(pk_cols) == 1:
+                existing.add((row[0],))
+    return existing
+
+
 def insert_to_mysql(shipments, items, host, port, user, password, database,
-                    batch_size=500, truncate=False, create_table=False,
+                    batch_size=500, on_conflict='update', create_table=False,
                     dry_run=False, retry_count=3, retry_delay=2):
     """
     将生成的数据写入 MySQL 数据库。
 
-    Args:
-        shipments: 货件主表数据列表
-        items: 明细表数据列表
-        host/port/user/password/database: 数据库连接参数
-        batch_size: 每批提交的行数
-        truncate: 是否在插入前清空表
-        create_table: 是否自动建表
-        dry_run: 仅打印 SQL 不实际执行
-        retry_count: 连接失败重试次数
-        retry_delay: 重试间隔（秒）
+    冲突处理策略 (on_conflict):
+        'error'  - 遇到主键冲突直接报错（默认 INSERT 行为）
+        'skip'   - 跳过冲突数据，仅插入新数据
+        'update' - 新数据覆盖旧数据（ON DUPLICATE KEY UPDATE，默认）
+        'merge'  - 合并策略：新数据中非NULL字段覆盖旧值，NULL字段保留旧值
     """
     try:
         import pymysql
@@ -1896,77 +1944,149 @@ def insert_to_mysql(shipments, items, host, port, user, password, database,
                 print(f"  ✅ 明细表已就绪")
                 conn.commit()
 
-        # 清空表
-        if truncate:
-            if dry_run:
-                print(f"\n[DRY-RUN] 将执行以下清空操作:")
-                print(f"  TRUNCATE TABLE `mws_fi_data_inbound_shipment_item`")
-                print(f"  TRUNCATE TABLE `mws_fi_data_inbound_shipment`")
-            else:
-                print(f"\n🗑️  清空目标表...")
-                cursor.execute("TRUNCATE TABLE `mws_fi_data_inbound_shipment_item`")
-                cursor.execute("TRUNCATE TABLE `mws_fi_data_inbound_shipment`")
-                conn.commit()
-                print(f"  ✅ 表已清空")
-
-        # dry-run 模式：打印前几条 INSERT 语句
-        if dry_run:
-            print(f"\n[DRY-RUN] 将执行以下 INSERT 语句（仅展示前3条）:")
+        # 冲突检测
+        conflict_shipments = set()
+        conflict_items = set()
+        try:
             if shipments:
-                print(f"\n--- 货件主表（共 {len(shipments)} 条）---")
-                for s in shipments[:3]:
-                    cols_vals = [(k, v) for k, v in s.items() if v is not None]
-                    if cols_vals:
-                        cols = ', '.join(k for k, _ in cols_vals)
-                        vals = ', '.join(_sql_value(v) for _, v in cols_vals)
-                        print(f"  INSERT INTO `mws_fi_data_inbound_shipment` ({cols}) VALUES ({vals});")
-                if len(shipments) > 3:
-                    print(f"  ... 省略 {len(shipments) - 3} 条")
+                ship_keys = [(s.get('SHIPMENT_ID', ''),) for s in shipments if s.get('SHIPMENT_ID')]
+                conflict_shipments = _check_existing_keys(cursor, 'mws_fi_data_inbound_shipment', ['SHIPMENT_ID'], ship_keys)
             if items:
-                print(f"\n--- 明细表（共 {len(items)} 条）---")
-                for item in items[:3]:
-                    cols_vals = [(k, v) for k, v in item.items() if v is not None]
-                    if cols_vals:
-                        cols = ', '.join(k for k, _ in cols_vals)
-                        vals = ', '.join(_sql_value(v) for _, v in cols_vals)
-                        print(f"  INSERT INTO `mws_fi_data_inbound_shipment_item` ({cols}) VALUES ({vals});")
-                if len(items) > 3:
-                    print(f"  ... 省略 {len(items) - 3} 条")
-            print(f"\n[DRY-RUN] 模式结束，未实际写入数据。")
+                item_keys = [(it.get('SHIPMENT_ID', ''), it.get('SELLER_SKU', '')) for it in items
+                             if it.get('SHIPMENT_ID') and it.get('SELLER_SKU')]
+                conflict_items = _check_existing_keys(cursor, 'mws_fi_data_inbound_shipment_item',
+                                                       ['SHIPMENT_ID', 'SELLER_SKU'], item_keys)
+        except Exception as e:
+            # 表可能不存在，跳过冲突检测
+            print(f"  ⚠️  冲突检测跳过（表可能不存在）: {e}")
+
+        # 报告冲突
+        if conflict_shipments or conflict_items:
+            print(f"\n⚠️  检测到数据冲突:")
+            if conflict_shipments:
+                print(f"  货件主表: {len(conflict_shipments)} 条数据与已有记录主键冲突")
+                # 展示前5条冲突的主键
+                for idx, ck in enumerate(list(conflict_shipments)[:5]):
+                    print(f"    冲突 SHIPMENT_ID: {ck[0]}")
+                if len(conflict_shipments) > 5:
+                    print(f"    ... 还有 {len(conflict_shipments) - 5} 条冲突")
+            if conflict_items:
+                print(f"  明细表: {len(conflict_items)} 条数据与已有记录主键冲突")
+                for idx, ck in enumerate(list(conflict_items)[:5]):
+                    print(f"    冲突 SHIPMENT_ID={ck[0]}, SELLER_SKU={ck[1]}")
+                if len(conflict_items) > 5:
+                    print(f"    ... 还有 {len(conflict_items) - 5} 条冲突")
+
+            if on_conflict == 'error':
+                print(f"\n❌ 冲突处理策略为 'error'，终止插入。请改用 --on-conflict skip/update/merge 处理冲突。")
+                cursor.close()
+                conn.close()
+                return
+            elif on_conflict == 'skip':
+                print(f"  📋 冲突处理: 跳过冲突数据，仅插入新数据")
+            elif on_conflict == 'update':
+                print(f"  📋 冲突处理: 新数据覆盖旧数据（UPSERT）")
+            elif on_conflict == 'merge':
+                print(f"  📋 冲突处理: 合并数据（新值非NULL时覆盖，NULL保留旧值）")
+        else:
+            print(f"\n✅ 无主键冲突，可安全插入")
+
+        # dry-run 模式：打印前几条 SQL 语句
+        if dry_run:
+            _dry_run_print(shipments, items, on_conflict, conflict_shipments, conflict_items)
             return
 
-        # 动态构建 INSERT
+        # ---- 写入货件主表 ----
         if shipments:
-            print(f"\n📦 插入货件主表...")
+            print(f"\n📦 写入货件主表...")
+            inserted, updated, skipped = 0, 0, 0
             for i, s in enumerate(shipments):
+                pk = (s.get('SHIPMENT_ID', ''),)
+                is_conflict = pk in conflict_shipments
+
+                # skip 模式：跳过冲突行
+                if on_conflict == 'skip' and is_conflict:
+                    skipped += 1
+                    continue
+
                 cols_vals = [(k, v) for k, v in s.items() if v is not None]
-                if cols_vals:
-                    cols = ', '.join(k for k, _ in cols_vals)
-                    placeholders = ', '.join(['%s'] * len(cols_vals))
-                    vals = [v for _, v in cols_vals]
+                if not cols_vals:
+                    continue
+                cols = ', '.join(k for k, _ in cols_vals)
+                placeholders = ', '.join(['%s'] * len(cols_vals))
+                vals = [v for _, v in cols_vals]
+
+                if is_conflict and on_conflict in ('update', 'merge'):
+                    # ON DUPLICATE KEY UPDATE
+                    if on_conflict == 'update':
+                        # 全量覆盖：所有非主键字段都更新
+                        update_cols = [k for k, _ in cols_vals if k != 'SHIPMENT_ID']
+                        update_clause = ', '.join(f"`{k}` = VALUES(`{k}`)" for k in update_cols)
+                    else:
+                        # merge 模式：仅更新非 NULL 的新值
+                        update_cols = [k for k, v in cols_vals if k != 'SHIPMENT_ID' and v is not None]
+                        update_clause = ', '.join(
+                            f"`{k}` = IF(VALUES(`{k}`) IS NOT NULL, VALUES(`{k}`), `{k}`)"
+                            for k in update_cols
+                        )
+                    sql = f"INSERT INTO `mws_fi_data_inbound_shipment` ({cols}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_clause}"
+                    cursor.execute(sql, vals)
+                    updated += 1
+                else:
                     sql = f"INSERT INTO `mws_fi_data_inbound_shipment` ({cols}) VALUES ({placeholders})"
                     cursor.execute(sql, vals)
+                    inserted += 1
+
                 if (i + 1) % batch_size == 0:
                     conn.commit()
-                    print(f"  已插入 {i + 1}/{len(shipments)} 条")
+                    print(f"  已处理 {i + 1}/{len(shipments)} 条")
             conn.commit()
-            print(f"  ✅ 货件主表完成: {len(shipments)} 条")
+            print(f"  ✅ 货件主表完成: 新增 {inserted} 条, 更新 {updated} 条, 跳过 {skipped} 条")
 
+        # ---- 写入明细表 ----
         if items:
-            print(f"\n📋 插入货件明细...")
+            print(f"\n📋 写入明细表...")
+            inserted, updated, skipped = 0, 0, 0
             for i, item in enumerate(items):
+                pk = (item.get('SHIPMENT_ID', ''), item.get('SELLER_SKU', ''))
+                is_conflict = pk in conflict_items
+
+                # skip 模式：跳过冲突行
+                if on_conflict == 'skip' and is_conflict:
+                    skipped += 1
+                    continue
+
                 cols_vals = [(k, v) for k, v in item.items() if v is not None]
-                if cols_vals:
-                    cols = ', '.join(k for k, _ in cols_vals)
-                    placeholders = ', '.join(['%s'] * len(cols_vals))
-                    vals = [v for _, v in cols_vals]
+                if not cols_vals:
+                    continue
+                cols = ', '.join(k for k, _ in cols_vals)
+                placeholders = ', '.join(['%s'] * len(cols_vals))
+                vals = [v for _, v in cols_vals]
+
+                if is_conflict and on_conflict in ('update', 'merge'):
+                    pk_names = {'SHIPMENT_ID', 'SELLER_SKU'}
+                    if on_conflict == 'update':
+                        update_cols = [k for k, _ in cols_vals if k not in pk_names]
+                        update_clause = ', '.join(f"`{k}` = VALUES(`{k}`)" for k in update_cols)
+                    else:
+                        update_cols = [k for k, v in cols_vals if k not in pk_names and v is not None]
+                        update_clause = ', '.join(
+                            f"`{k}` = IF(VALUES(`{k}`) IS NOT NULL, VALUES(`{k}`), `{k}`)"
+                            for k in update_cols
+                        )
+                    sql = f"INSERT INTO `mws_fi_data_inbound_shipment_item` ({cols}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {update_clause}"
+                    cursor.execute(sql, vals)
+                    updated += 1
+                else:
                     sql = f"INSERT INTO `mws_fi_data_inbound_shipment_item` ({cols}) VALUES ({placeholders})"
                     cursor.execute(sql, vals)
+                    inserted += 1
+
                 if (i + 1) % batch_size == 0:
                     conn.commit()
-                    print(f"  已插入 {i + 1}/{len(items)} 条")
+                    print(f"  已处理 {i + 1}/{len(items)} 条")
             conn.commit()
-            print(f"  ✅ 明细表完成: {len(items)} 条")
+            print(f"  ✅ 明细表完成: 新增 {inserted} 条, 更新 {updated} 条, 跳过 {skipped} 条")
 
         print(f"\n✅ 数据写入完成！")
 
@@ -1980,6 +2100,69 @@ def insert_to_mysql(shipments, items, host, port, user, password, database,
             cursor.close()
         if conn:
             conn.close()
+
+
+def _dry_run_print(shipments, items, on_conflict, conflict_shipments, conflict_items):
+    """dry-run 模式下打印将要执行的 SQL 语句"""
+    print(f"\n[DRY-RUN] 冲突处理策略: {on_conflict}")
+    print(f"[DRY-RUN] 将执行以下 SQL 语句（仅展示前3条）:")
+    limit = 3
+
+    if shipments:
+        print(f"\n--- 货件主表（共 {len(shipments)} 条，冲突 {len(conflict_shipments)} 条）---")
+        for s in shipments[:limit]:
+            cols_vals = [(k, v) for k, v in s.items() if v is not None]
+            if cols_vals:
+                cols = ', '.join(k for k, _ in cols_vals)
+                vals = ', '.join(_sql_value(v) for _, v in cols_vals)
+                pk = (s.get('SHIPMENT_ID', ''),)
+                is_conflict = pk in conflict_shipments
+                if is_conflict and on_conflict in ('update', 'merge'):
+                    pk_names = {'SHIPMENT_ID'}
+                    if on_conflict == 'update':
+                        update_cols = [k for k, _ in cols_vals if k not in pk_names]
+                        update_clause = ', '.join(f"`{k}` = VALUES(`{k}`)" for k in update_cols)
+                    else:
+                        update_cols = [k for k, v in cols_vals if k not in pk_names and v is not None]
+                        update_clause = ', '.join(
+                            f"`{k}` = IF(VALUES(`{k}`) IS NOT NULL, VALUES(`{k}`), `{k}`)"
+                            for k in update_cols
+                        )
+                    print(f"  INSERT INTO `mws_fi_data_inbound_shipment` ({cols}) VALUES ({vals}) ON DUPLICATE KEY UPDATE {update_clause};")
+                elif is_conflict and on_conflict == 'skip':
+                    print(f"  -- SKIP: SHIPMENT_ID={s.get('SHIPMENT_ID')} (主键冲突，跳过)")
+                else:
+                    print(f"  INSERT INTO `mws_fi_data_inbound_shipment` ({cols}) VALUES ({vals});")
+        if len(shipments) > limit:
+            print(f"  ... 省略 {len(shipments) - limit} 条")
+    if items:
+        print(f"\n--- 明细表（共 {len(items)} 条，冲突 {len(conflict_items)} 条）---")
+        for item in items[:limit]:
+            cols_vals = [(k, v) for k, v in item.items() if v is not None]
+            if cols_vals:
+                cols = ', '.join(k for k, _ in cols_vals)
+                vals = ', '.join(_sql_value(v) for _, v in cols_vals)
+                pk = (item.get('SHIPMENT_ID', ''), item.get('SELLER_SKU', ''))
+                is_conflict = pk in conflict_items
+                pk_names = {'SHIPMENT_ID', 'SELLER_SKU'}
+                if is_conflict and on_conflict in ('update', 'merge'):
+                    if on_conflict == 'update':
+                        update_cols = [k for k, _ in cols_vals if k not in pk_names]
+                        update_clause = ', '.join(f"`{k}` = VALUES(`{k}`)" for k in update_cols)
+                    else:
+                        update_cols = [k for k, v in cols_vals if k not in pk_names and v is not None]
+                        update_clause = ', '.join(
+                            f"`{k}` = IF(VALUES(`{k}`) IS NOT NULL, VALUES(`{k}`), `{k}`)"
+                            for k in update_cols
+                        )
+                    print(f"  INSERT INTO `mws_fi_data_inbound_shipment_item` ({cols}) VALUES ({vals}) ON DUPLICATE KEY UPDATE {update_clause};")
+                elif is_conflict and on_conflict == 'skip':
+                    print(f"  -- SKIP: SHIPMENT_ID={item.get('SHIPMENT_ID')}, SELLER_SKU={item.get('SELLER_SKU')} (主键冲突，跳过)")
+                else:
+                    print(f"  INSERT INTO `mws_fi_data_inbound_shipment_item` ({cols}) VALUES ({vals});")
+        if len(items) > limit:
+            print(f"  ... 省略 {len(items) - limit} 条")
+    print(f"\n[DRY-RUN] 模式结束，未实际写入数据。")
 
 
 # ============================================================
@@ -2050,7 +2233,7 @@ def cli_main_with_config(args, shipment_config, item_config):
             host=db_host, port=db_port,
             user=db_user, password=db_pass,
             database=db_name,
-            truncate=args.truncate,
+            on_conflict=args.on_conflict,
             create_table=args.create_table,
             dry_run=args.dry_run,
         )
@@ -2110,8 +2293,8 @@ def main():
                         help='数据库配置文件路径（默认: 脚本同目录/db_config.json）')
 
     # 数据库操作选项
-    parser.add_argument('--truncate', action='store_true',
-                        help='插入数据前清空目标表')
+    parser.add_argument('--on-conflict', choices=['error', 'skip', 'update', 'merge'], default='update',
+                        help='主键冲突处理策略: error=报错, skip=跳过, update=新值覆盖旧值(默认), merge=合并非NULL值')
     parser.add_argument('--create-table', action='store_true',
                         help='自动创建目标表（IF NOT EXISTS）')
     parser.add_argument('--dry-run', action='store_true',
@@ -2120,6 +2303,9 @@ def main():
                         help='测试数据库连接是否可用')
     parser.add_argument('--export-ddl', action='store_true',
                         help='导出建表 DDL 到 SQL 文件')
+    # 保留 --truncate 作为隐藏兼容选项（不推荐使用）
+    parser.add_argument('--truncate', action='store_true',
+                        help=argparse.SUPPRESS)  # 已弃用，保留向后兼容
 
     args = parser.parse_args()
 
@@ -2136,6 +2322,12 @@ def main():
     args.user = args.user or 'root'
     args.password = args.password or ''
     args.database = args.database or 'test'
+
+    # --truncate 兼容处理：如果用了旧参数 --truncate，提示用户迁移
+    if args.truncate:
+        print("⚠️  --truncate 已弃用，数据不再清空。新数据将与已有数据合并（--on-conflict update）。")
+        print("   如需清空表，请手动执行: TRUNCATE TABLE 表名;")
+        args.truncate = False
 
     # 测试数据库连接
     if args.test_conn:
