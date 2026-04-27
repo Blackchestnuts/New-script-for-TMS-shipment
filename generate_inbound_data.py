@@ -21,8 +21,26 @@
   # 命令行模式（非交互式）
   python generate_inbound_data.py --count 50 --output csv
 
+  - 支持 Excel 模板编辑配置（更直观）
+
+用法：
+  # 交互式模式（推荐）
+  python generate_inbound_data.py
+
+  # 导出空白 Excel 模板，用 Excel 编辑后使用
+  python generate_inbound_data.py --export-excel-template
+
+  # 使用 Excel 模板生成数据
+  python generate_inbound_data.py --template-excel my_config.xlsx --count 50 --output csv
+
+  # 使用 JSON 模板快速生成
+  python generate_inbound_data.py --template default
+
+  # 命令行模式（非交互式）
+  python generate_inbound_data.py --count 50 --output csv
+
 依赖安装：
-  pip install faker pymysql
+  pip install faker pymysql openpyxl
 """
 
 import argparse
@@ -38,6 +56,12 @@ try:
 except ImportError:
     print("缺少 faker 库，请执行: pip install faker")
     sys.exit(1)
+
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 # ============================================================
 # 字段定义 —— 每个字段的元信息
@@ -866,13 +890,21 @@ def interactive_main():
 
     # 2. 是否使用已保存的模板
     template = None
-    if yes_no("\n是否加载已保存的配置模板？", "n"):
+    print("\n  加载配置模板的方式:")
+    print("    1. 不使用模板（手动交互配置）")
+    print("    2. 加载 JSON 模板")
+    print("    3. 加载 Excel 模板")
+    template_choice = input_with_default("  请选择", "1")
+    if template_choice == "2":
         template_name = input_with_default("  模板名称", "default")
         template = load_template(template_name)
         if template:
             print(f"  ✅ 已加载模板: {template_name}")
         else:
             print(f"  ⚠️  模板不存在，将进入手动配置")
+    elif template_choice == "3":
+        excel_path = input_with_default("  Excel 文件路径", "template_config.xlsx")
+        template = load_template_excel(excel_path)
 
     # 3. 配置货件主表字段
     if template and "shipment" in template:
@@ -894,8 +926,17 @@ def interactive_main():
 
     # 5. 保存模板
     if yes_no("\n是否保存当前配置为模板？（下次可复用）", "y"):
+        print("  保存格式:")
+        print("    1. JSON 模板")
+        print("    2. Excel 模板")
+        print("    3. 两种都保存")
+        save_choice = input_with_default("  请选择", "2")
         template_name = input_with_default("  模板名称", "default")
-        save_template(template_name, shipment_config, item_config)
+        if save_choice in ("1", "3"):
+            save_template(template_name, shipment_config, item_config)
+        if save_choice in ("2", "3"):
+            excel_path = template_name if template_name.endswith('.xlsx') else f"{template_name}.xlsx"
+            save_template_excel(excel_path, shipment_config, item_config)
 
     # 6. 输出方式
     print("\n【输出方式】\n")
@@ -948,12 +989,76 @@ def interactive_main():
     print("\n🎉 完成！")
 
 
+def interactive_main_with_template(args, template):
+    """使用模板的半交互式模式：模板提供配置，只需输入数量和输出方式"""
+    print_separator()
+    print("  🚀 亚马逊 FBA 入库货件 —— 模板模式")
+    print_separator()
+
+    shipment_config = template.get("shipment", {})
+    item_config = template.get("item", {})
+
+    # 只需输入数量
+    print("\n【基本参数】\n")
+    count = int(input_with_default("  生成货件数量", str(args.count)))
+    min_items = int(input_with_default("  每个货件最少 SKU 数", str(args.min_items)))
+    max_items = int(input_with_default("  每个货件最多 SKU 数", str(args.max_items)))
+
+    # 输出方式
+    print("\n【输出方式】\n")
+    print("  1. CSV 文件")
+    print("  2. SQL 文件")
+    print("  3. 直连 MySQL 写入")
+    output_choice = input_with_default("  请选择", "1")
+
+    if output_choice == "1":
+        output_mode = "csv"
+        output_dir = input_with_default("  输出目录", "./output")
+    elif output_choice == "2":
+        output_mode = "sql"
+        output_dir = input_with_default("  SQL 文件路径", "./insert_data.sql")
+    else:
+        output_mode = "db"
+        db_host = input_with_default("  MySQL 主机", "127.0.0.1")
+        db_port = int(input_with_default("  MySQL 端口", "3306"))
+        db_user = input_with_default("  MySQL 用户", "root")
+        db_pass = input("  MySQL 密码: ").strip()
+        db_name = input_with_default("  数据库名", "test")
+
+    # 生成
+    print_title("开始生成数据")
+
+    generator = InboundDataGenerator()
+    shipments, items = generator.generate_batch(
+        count=count,
+        shipment_config=shipment_config,
+        item_config=item_config,
+        min_items=min_items,
+        max_items=max_items,
+    )
+
+    print(f"\n📊 数据统计:")
+    print(f"  货件总数: {len(shipments)}")
+    print(f"  明细总数: {len(items)}")
+    if shipments:
+        print(f"  平均每货件 SKU: {len(items) / len(shipments):.1f}")
+
+    if output_mode == "csv":
+        export_to_csv(shipments, items, output_dir)
+    elif output_mode == "sql":
+        export_to_sql(shipments, items, output_dir)
+    elif output_mode == "db":
+        insert_to_mysql(shipments, items, db_host, db_port, db_user, db_pass, db_name)
+
+    print("\n🎉 完成！")
+
+
 # ============================================================
 # 模板管理
 # ============================================================
 
 def save_template(name, shipment_config, item_config):
-    """保存配置模板"""
+    """保存配置模板为 JSON"""
     os.makedirs(TEMPLATE_DIR, exist_ok=True)
     filepath = os.path.join(TEMPLATE_DIR, f"{name}.json")
     data = {
@@ -964,11 +1069,11 @@ def save_template(name, shipment_config, item_config):
     }
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"  ✅ 模板已保存: {filepath}")
+    print(f"  ✅ JSON 模板已保存: {filepath}")
 
 
 def load_template(name):
-    """加载配置模板"""
+    """加载 JSON 配置模板"""
     filepath = os.path.join(TEMPLATE_DIR, f"{name}.json")
     if not os.path.exists(filepath):
         return None
@@ -990,8 +1095,291 @@ def list_templates():
                 "name": data.get("name", f[:-5]),
                 "created_at": data.get("created_at", "未知"),
                 "filepath": filepath,
+                "format": "json",
             })
     return templates
+
+
+# ============================================================
+# Excel 模板管理
+# ============================================================
+
+def _get_field_choices_str(fdef):
+    """获取字段可选值的描述字符串"""
+    choices = fdef.get("choices", [])
+    if isinstance(choices, dict):
+        return ",".join(f"{k}({v})" for k, v in choices.items())
+    elif isinstance(choices, list):
+        return ",".join(str(c) for c in choices)
+    return ""
+
+
+def export_template_excel(output_path="template_config.xlsx"):
+    """
+    导出空白 Excel 配置模板，用户可在 Excel 中编辑后使用
+
+    Excel 结构：
+      Sheet1 "货件主表" — 字段配置
+      Sheet2 "货件明细" — 字段配置
+      Sheet3 "说明" — 使用说明
+    """
+    if not HAS_OPENPYXL:
+        print("缺少 openpyxl 库，请执行: pip install openpyxl")
+        sys.exit(1)
+
+    wb = openpyxl.Workbook()
+
+    # ---- Sheet1: 货件主表 ----
+    ws1 = wb.active
+    ws1.title = "货件主表"
+
+    # 表头
+    headers = ["字段名", "中文名", "是否生成", "生成模式", "固定值", "范围最小值", "范围最大值", "可选项(逗号分隔)"]
+    for col, h in enumerate(headers, 1):
+        cell = ws1.cell(row=1, column=col, value=h)
+        cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        cell.fill = openpyxl.styles.PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        cell.alignment = openpyxl.styles.Alignment(horizontal="center")
+
+    # 填充字段
+    for i, (fname, fdef) in enumerate(SHIPMENT_FIELDS.items(), 2):
+        is_required = fdef.get("required", False)
+        is_auto = fdef.get("auto", False)
+        is_inherit = fdef.get("type") == "inherit"
+        is_nullable = fdef.get("nullable", False)
+
+        # 字段名
+        ws1.cell(row=i, column=1, value=fname)
+        # 中文名
+        ws1.cell(row=i, column=2, value=fdef.get("label", ""))
+        # 是否生成
+        if is_required or is_auto or is_inherit:
+            ws1.cell(row=i, column=3, value="是")
+            cell = ws1.cell(row=i, column=3)
+            cell.fill = openpyxl.styles.PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+        else:
+            ws1.cell(row=i, column=3, value="是")  # 默认是
+        # 生成模式
+        if is_auto or is_inherit:
+            ws1.cell(row=i, column=4, value="auto")
+        else:
+            ws1.cell(row=i, column=4, value="auto")
+        # 固定值
+        ws1.cell(row=i, column=5, value="")
+        # 范围最小值
+        rng = fdef.get("range", [])
+        ws1.cell(row=i, column=6, value=rng[0] if rng else "")
+        # 范围最大值
+        ws1.cell(row=i, column=7, value=rng[1] if rng else "")
+        # 可选项
+        choices_str = _get_field_choices_str(fdef)
+        ws1.cell(row=i, column=8, value=choices_str)
+
+        # 必填行标灰
+        if is_required:
+            for col in range(1, 9):
+                cell = ws1.cell(row=i, column=col)
+                if not cell.fill or cell.fill.start_color.rgb == "00000000":
+                    cell.fill = openpyxl.styles.PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    # 列宽
+    col_widths = [38, 18, 10, 12, 25, 14, 14, 50]
+    for idx, w in enumerate(col_widths, 1):
+        ws1.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = w
+
+    # ---- Sheet2: 货件明细 ----
+    ws2 = wb.create_sheet("货件明细")
+
+    for col, h in enumerate(headers, 1):
+        cell = ws2.cell(row=1, column=col, value=h)
+        cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+        cell.fill = openpyxl.styles.PatternFill(start_color="548235", end_color="548235", fill_type="solid")
+        cell.alignment = openpyxl.styles.Alignment(horizontal="center")
+
+    for i, (fname, fdef) in enumerate(ITEM_FIELDS.items(), 2):
+        is_required = fdef.get("required", False)
+        is_auto = fdef.get("auto", False)
+        is_inherit = fdef.get("type") == "inherit"
+
+        ws2.cell(row=i, column=1, value=fname)
+        ws2.cell(row=i, column=2, value=fdef.get("label", ""))
+        if is_required or is_auto or is_inherit:
+            ws2.cell(row=i, column=3, value="是")
+        else:
+            ws2.cell(row=i, column=3, value="是")
+        if is_auto or is_inherit:
+            ws2.cell(row=i, column=4, value="auto")
+        else:
+            ws2.cell(row=i, column=4, value="auto")
+        ws2.cell(row=i, column=5, value="")
+        rng = fdef.get("range", [])
+        ws2.cell(row=i, column=6, value=rng[0] if rng else "")
+        ws2.cell(row=i, column=7, value=rng[1] if rng else "")
+        choices_str = _get_field_choices_str(fdef)
+        ws2.cell(row=i, column=8, value=choices_str)
+
+        if is_required or is_inherit:
+            for col in range(1, 9):
+                cell = ws2.cell(row=i, column=col)
+                if not cell.fill or cell.fill.start_color.rgb == "00000000":
+                    cell.fill = openpyxl.styles.PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+
+    for idx, w in enumerate(col_widths, 1):
+        ws2.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = w
+
+    # ---- Sheet3: 说明 ----
+    ws3 = wb.create_sheet("说明")
+    instructions = [
+        ["Excel 配置模板使用说明", ""],
+        ["", ""],
+        ["列说明:", ""],
+        ["字段名", "数据库字段名，请勿修改"],
+        ["中文名", "字段中文描述，仅供参考"],
+        ["是否生成", "填 是 或 否。否 = 该字段留空(NULL)"],
+        ["生成模式", "auto=自动随机生成, fixed=使用固定值, range=范围内随机, null=留空"],
+        ["固定值", "生成模式=fixed 时，填写每条数据都使用的固定值"],
+        ["范围最小值", "生成模式=range 时，填写随机范围的最小值"],
+        ["范围最大值", "生成模式=range 时，填写随机范围的最大值"],
+        ["可选项", "生成模式=range 且字段类型=choice/string 时，填写可选值(逗号分隔)，将从中随机选"],
+        ["", ""],
+        ["示例:", ""],
+        ["只想造某个卖家的数据", "SELLER_ID 行: 生成模式=fixed, 固定值=AXXXXXXXXXXXXX"],
+        ["只想造已完成状态的数据", "SHIPMENT_STATUS 行: 生成模式=fixed, 固定值=7"],
+        ["发货数量控制在100~300之间", "QUANTITY_SHIPPED 行: 生成模式=range, 范围最小值=100, 范围最大值=300"],
+        ["只要美国市场的数据", "MARKETPLACE_ID 行: 生成模式=fixed, 固定值=ATVPDKIKX0DER"],
+        ["不要地址信息", "地址类字段: 是否生成=否"],
+        ["", ""],
+        ["使用方式:", ""],
+        ["1. 编辑此 Excel 文件中的配置"],
+        ["2. 保存后执行: python generate_inbound_data.py --template-excel template_config.xlsx --count 50 --output csv"],
+    ]
+    for i, row in enumerate(instructions, 1):
+        for j, val in enumerate(row, 1):
+            ws3.cell(row=i, column=j, value=val)
+        if i == 1 or i == 3 or i == 13 or i == 19:
+            ws3.cell(row=i, column=1).font = openpyxl.styles.Font(bold=True, size=12)
+    ws3.column_dimensions['A'].width = 35
+    ws3.column_dimensions['B'].width = 70
+
+    wb.save(output_path)
+    print(f"✅ Excel 模板已导出: {output_path}")
+    print(f"   请用 Excel 打开编辑，然后使用 --template-excel 参数加载")
+
+
+def load_template_excel(filepath):
+    """
+    从 Excel 文件加载配置模板
+
+    Returns:
+        dict: {"shipment": {...}, "item": {...}}
+    """
+    if not HAS_OPENPYXL:
+        print("缺少 openpyxl 库，请执行: pip install openpyxl")
+        sys.exit(1)
+
+    if not os.path.exists(filepath):
+        print(f"❌ 文件不存在: {filepath}")
+        return None
+
+    wb = openpyxl.load_workbook(filepath)
+
+    def parse_sheet(ws, fields_def):
+        """解析一个 Sheet 的配置"""
+        config = {}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if not row[0]:
+                continue
+            fname = str(row[0]).strip()
+            if fname not in fields_def:
+                continue
+
+            is_generate = str(row[2]).strip() if row[2] else "是"
+            mode = str(row[3]).strip() if row[3] else "auto"
+            fixed_value = str(row[4]).strip() if row[4] else ""
+            range_min = row[5]
+            range_max = row[6]
+            choices_str = str(row[7]).strip() if row[7] else ""
+
+            if is_generate in ("否", "n", "N", "no", "NO"):
+                fdef = fields_def[fname]
+                if fdef.get("required") or fdef.get("auto") or fdef.get("type") == "inherit":
+                    config[fname] = {"mode": "auto"}
+                else:
+                    config[fname] = {"mode": "null"}
+                continue
+
+            if mode == "fixed" and fixed_value:
+                config[fname] = {"mode": "fixed", "fixed_value": fixed_value}
+            elif mode == "range":
+                cfg = {"mode": "range"}
+                if range_min is not None:
+                    cfg["range_min"] = range_min
+                if range_max is not None:
+                    cfg["range_max"] = range_max
+                if choices_str:
+                    cfg["choices"] = [c.strip() for c in choices_str.split(",") if c.strip()]
+                config[fname] = cfg
+            elif mode == "null":
+                config[fname] = {"mode": "null"}
+            else:
+                config[fname] = {"mode": "auto"}
+
+        # 填充缺失字段
+        for fname, fdef in fields_def.items():
+            if fname not in config:
+                if fdef.get("required") or fdef.get("auto") or fdef.get("type") == "inherit":
+                    config[fname] = {"mode": "auto"}
+                else:
+                    config[fname] = {"mode": "null"}
+
+        return config
+
+    shipment_config = parse_sheet(wb["货件主表"], SHIPMENT_FIELDS)
+    item_config = parse_sheet(wb["货件明细"], ITEM_FIELDS)
+
+    print(f"✅ 已加载 Excel 模板: {filepath}")
+    return {"shipment": shipment_config, "item": item_config}
+
+
+def save_template_excel(filepath, shipment_config, item_config):
+    """将当前配置保存为 Excel 模板"""
+    if not HAS_OPENPYXL:
+        print("缺少 openpyxl 库，请执行: pip install openpyxl")
+        return
+
+    wb = openpyxl.Workbook()
+
+    def write_sheet(ws, title, fields_def, config_data, header_color):
+        ws.title = title
+        headers = ["字段名", "中文名", "是否生成", "生成模式", "固定值", "范围最小值", "范围最大值", "可选项(逗号分隔)"]
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.font = openpyxl.styles.Font(bold=True, color="FFFFFF")
+            cell.fill = openpyxl.styles.PatternFill(start_color=header_color, end_color=header_color, fill_type="solid")
+            cell.alignment = openpyxl.styles.Alignment(horizontal="center")
+
+        for i, (fname, fdef) in enumerate(fields_def.items(), 2):
+            cfg = config_data.get(fname, {"mode": "auto"})
+            mode = cfg.get("mode", "auto")
+
+            ws.cell(row=i, column=1, value=fname)
+            ws.cell(row=i, column=2, value=fdef.get("label", ""))
+            ws.cell(row=i, column=3, value="否" if mode == "null" else "是")
+            ws.cell(row=i, column=4, value=mode)
+            ws.cell(row=i, column=5, value=cfg.get("fixed_value", ""))
+            ws.cell(row=i, column=6, value=cfg.get("range_min", ""))
+            ws.cell(row=i, column=7, value=cfg.get("range_max", ""))
+            ws.cell(row=i, column=8, value=",".join(cfg.get("choices", [])))
+
+        col_widths = [38, 18, 10, 12, 25, 14, 14, 50]
+        for idx, w in enumerate(col_widths, 1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = w
+
+    write_sheet(wb.active, "货件主表", SHIPMENT_FIELDS, shipment_config, "4472C4")
+    write_sheet(wb.create_sheet("货件明细"), ITEM_FIELDS, item_config, "548235")
+
+    wb.save(filepath)
+    print(f"  ✅ Excel 模板已保存: {filepath}")
 
 
 # ============================================================
@@ -1144,16 +1532,19 @@ def insert_to_mysql(shipments, items, host, port, user, password, database, batc
 
 def cli_main(args):
     """命令行模式：快速生成，全部字段自动生成"""
+    shipment_config = {fname: {"mode": "auto"} for fname in SHIPMENT_FIELDS}
+    item_config = {fname: {"mode": "auto"} for fname in ITEM_FIELDS}
+    cli_main_with_config(args, shipment_config, item_config)
+
+
+def cli_main_with_config(args, shipment_config, item_config):
+    """命令行模式：使用指定配置生成"""
     print_separator()
     print("  🚀 亚马逊 FBA 入库货件数据生成器（快速模式）")
     print_separator()
     print(f"  货件数量: {args.count}")
     print(f"  每个货件 SKU 数: {args.min_items} ~ {args.max_items}")
     print(f"  输出方式: {args.output.upper()}")
-
-    # 全自动配置
-    shipment_config = {fname: {"mode": "auto"} for fname in SHIPMENT_FIELDS}
-    item_config = {fname: {"mode": "auto"} for fname in ITEM_FIELDS}
 
     generator = InboundDataGenerator(seed=args.seed)
     shipments, items = generator.generate_batch(
@@ -1224,7 +1615,11 @@ def main():
     parser.add_argument('--interactive', '-i', action='store_true', default=True,
                         help='交互式模式（默认开启）')
     parser.add_argument('--template', type=str, default=None,
-                        help='使用已保存的配置模板名称')
+                        help='使用已保存的 JSON 配置模板名称')
+    parser.add_argument('--template-excel', type=str, default=None,
+                        help='使用 Excel 配置模板文件路径')
+    parser.add_argument('--export-excel-template', action='store_true',
+                        help='导出空白 Excel 配置模板')
     parser.add_argument('--list-templates', action='store_true',
                         help='列出所有已保存的模板')
 
@@ -1251,18 +1646,42 @@ def main():
         if templates:
             print("已保存的配置模板:")
             for t in templates:
-                print(f"  📄 {t['name']}  (创建于 {t['created_at']})")
+                print(f"  📄 {t['name']}  ({t['format']}) 创建于 {t['created_at']}")
         else:
             print("暂无已保存的模板。")
         return
 
+    # 导出 Excel 模板
+    if args.export_excel_template:
+        output_path = args.output_dir if args.output_dir != './output' else 'template_config.xlsx'
+        export_template_excel(output_path)
+        return
+
     # 指定了 --output 则走快速模式
     if args.output:
-        cli_main(args)
+        # 如果同时指定了 Excel 模板
+        if args.template_excel:
+            template = load_template_excel(args.template_excel)
+            if not template:
+                sys.exit(1)
+            shipment_config = template.get("shipment", {})
+            item_config = template.get("item", {})
+        else:
+            shipment_config = {fname: {"mode": "auto"} for fname in SHIPMENT_FIELDS}
+            item_config = {fname: {"mode": "auto"} for fname in ITEM_FIELDS}
+
+        cli_main_with_config(args, shipment_config, item_config)
         return
 
     # 否则走交互式
-    if args.template:
+    if args.template_excel:
+        # 使用 Excel 模板 + 交互式输入数量和输出方式
+        template = load_template_excel(args.template_excel)
+        if template:
+            interactive_main_with_template(args, template)
+        else:
+            sys.exit(1)
+    elif args.template:
         template = load_template(args.template)
         if template:
             print(f"✅ 已加载模板: {args.template}")
