@@ -499,15 +499,10 @@ class InboundDataGenerator:
             return None
 
         elif gen_type == "create_time":
-            return self._random_date().strftime('%Y-%m-%d %H:%M:%S')
+            return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         elif gen_type == "update_time":
-            status = context.get("SHIPMENT_STATUS", 1) if context else 1
-            create = context.get("CREATE_TIME", "") if context else ""
-            if status >= 2 and create:
-                ct = datetime.strptime(create, '%Y-%m-%d %H:%M:%S')
-                return (ct + timedelta(hours=random.randint(1, 720))).strftime('%Y-%m-%d %H:%M:%S')
-            return None
+            return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
         elif gen_type == "seller_sku":
             return self._gen_seller_sku()
@@ -1979,8 +1974,6 @@ def insert_to_mysql(shipments, items, host, port, user, password, database,
 
             if on_conflict == 'error':
                 print(f"\n❌ 冲突处理策略为 'error'，终止插入。请改用 --on-conflict skip/update/merge 处理冲突。")
-                cursor.close()
-                conn.close()
                 return
             elif on_conflict == 'skip':
                 print(f"  📋 冲突处理: 跳过冲突数据，仅插入新数据")
@@ -2097,9 +2090,16 @@ def insert_to_mysql(shipments, items, host, port, user, password, database,
         raise
     finally:
         if cursor:
-            cursor.close()
+            try:
+                cursor.close()
+            except Exception:
+                pass
         if conn:
-            conn.close()
+            try:
+                if hasattr(conn, 'open') and conn.open:
+                    conn.close()
+            except Exception:
+                pass
 
 
 def _dry_run_print(shipments, items, on_conflict, conflict_shipments, conflict_items):
