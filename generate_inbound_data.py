@@ -7,21 +7,10 @@
 
 功能：
   - 交互式选择要生成的字段
-  - 每个字段可选：自动生成 / 固定值 / 自定义范围
-  - 支持保存/加载配置模板，下次直接复用
+  - 每个字段可选：自动生成 / 固定值 / 自定义范围 / 留空
+  - 支持 JSON / Excel 两种模板格式，保存/加载配置，下次直接复用
   - 三种输出方式：CSV / SQL / 直连MySQL
-
-用法：
-  # 交互式模式（推荐）
-  python generate_inbound_data.py
-
-  # 使用已保存的模板快速生成
-  python generate_inbound_data.py --template default
-
-  # 命令行模式（非交互式）
-  python generate_inbound_data.py --count 50 --output csv
-
-  - 支持 Excel 模板编辑配置（更直观）
+  - 数据库增强：自动建表、清空表、连接测试、dry-run、配置文件
 
 用法：
   # 交互式模式（推荐）
@@ -36,8 +25,23 @@
   # 使用 JSON 模板快速生成
   python generate_inbound_data.py --template default
 
-  # 命令行模式（非交互式）
+  # 命令行模式（非交互式，全部自动）
   python generate_inbound_data.py --count 50 --output csv
+
+  # 直连 MySQL 写入（自动建表 + 清空旧数据）
+  python generate_inbound_data.py --count 50 --output db --create-table --truncate
+
+  # 仅预览 SQL 不实际写入（dry-run）
+  python generate_inbound_data.py --count 10 --output db --dry-run --create-table
+
+  # 测试数据库连接
+  python generate_inbound_data.py --test-conn --host 192.168.1.100 --user admin --password xxx
+
+  # 导出建表 DDL
+  python generate_inbound_data.py --export-ddl
+
+  # 使用 db_config.json 保存数据库连接配置
+  python generate_inbound_data.py --count 50 --output db --db-config ./my_db_config.json
 
 依赖安装：
   pip install faker pymysql openpyxl
@@ -49,6 +53,7 @@ import json
 import os
 import random
 import sys
+import time
 from datetime import datetime, timedelta
 
 try:
@@ -305,6 +310,7 @@ SHIPMENT_STATUS_WEIGHTS = [5, 15, 10, 10, 3, 5, 30, 10, 8, 4]
 
 # 配置模板保存路径
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
+EXCEL_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "excel_templates")
 
 
 # ============================================================
@@ -890,6 +896,7 @@ def interactive_main():
 
     # 2. 是否使用已保存的模板
     template = None
+    template_from_excel_dir = False
     print("\n  加载配置模板的方式:")
     print("    1. 不使用模板（手动交互配置）")
     print("    2. 加载 JSON 模板")
@@ -903,8 +910,8 @@ def interactive_main():
         else:
             print(f"  ⚠️  模板不存在，将进入手动配置")
     elif template_choice == "3":
-        excel_path = input_with_default("  Excel 文件路径", "template_config.xlsx")
-        template = load_template_excel(excel_path)
+        template = _interactive_pick_excel_template()
+        template_from_excel_dir = template is not None
 
     # 3. 配置货件主表字段
     if template and "shipment" in template:
@@ -924,8 +931,10 @@ def interactive_main():
             "mws_fi_data_inbound_shipment_item", ITEM_FIELDS
         )
 
-    # 5. 保存模板
-    if yes_no("\n是否保存当前配置为模板？（下次可复用）", "y"):
+    # 5. 保存模板（如果配置来自 excel_templates 目录，跳过保存）
+    if template_from_excel_dir:
+        print("\n  ✅ 配置来自 excel_templates 目录，无需重复保存")
+    elif yes_no("\n是否保存当前配置为模板？（下次可复用）", "y"):
         print("  保存格式:")
         print("    1. JSON 模板")
         print("    2. Excel 模板")
@@ -936,7 +945,7 @@ def interactive_main():
             save_template(template_name, shipment_config, item_config)
         if save_choice in ("2", "3"):
             excel_path = template_name if template_name.endswith('.xlsx') else f"{template_name}.xlsx"
-            save_template_excel(excel_path, shipment_config, item_config)
+            save_template_excel(os.path.join(EXCEL_TEMPLATE_DIR, excel_path), shipment_config, item_config)
 
     # 6. 输出方式
     print("\n【输出方式】\n")
@@ -945,19 +954,41 @@ def interactive_main():
     print("  3. 直连 MySQL 写入")
     output_choice = input_with_default("  请选择", "1")
 
+    db_create_table = False
+    db_truncate = False
+    db_dry_run = False
+
     if output_choice == "1":
         output_mode = "csv"
-        output_dir = input_with_default("  输出目录", "./output")
+        output_dir = input_with_default("  输出目录", "./data")
     elif output_choice == "2":
         output_mode = "sql"
-        output_dir = input_with_default("  SQL 文件路径", "./insert_data.sql")
+        output_dir = input_with_default("  SQL 文件路径", "./data/insert_data.sql")
     else:
         output_mode = "db"
-        db_host = input_with_default("  MySQL 主机", "127.0.0.1")
-        db_port = int(input_with_default("  MySQL 端口", "3306"))
-        db_user = input_with_default("  MySQL 用户", "root")
+        # 尝试加载已保存的数据库配置
+        saved_cfg = load_db_config()
+        default_host = saved_cfg["host"]
+        default_port = str(saved_cfg["port"])
+        default_user = saved_cfg["user"]
+        default_db = saved_cfg["database"]
+
+        db_host = input_with_default("  MySQL 主机", default_host)
+        db_port = int(input_with_default("  MySQL 端口", default_port))
+        db_user = input_with_default("  MySQL 用户", default_user)
         db_pass = input("  MySQL 密码: ").strip()
-        db_name = input_with_default("  数据库名", "test")
+        db_name = input_with_default("  数据库名", default_db)
+
+        # 数据库操作选项
+        if yes_no("  是否自动创建表（IF NOT EXISTS）?", "y"):
+            db_create_table = True
+        if yes_no("  是否清空已有数据?", "n"):
+            db_truncate = True
+
+        # 保存数据库配置
+        if not os.path.exists(DB_CONFIG_FILE):
+            if yes_no("  是否保存数据库配置（下次免输入）?", "y"):
+                save_db_config({"host": db_host, "port": db_port, "user": db_user, "password": db_pass, "database": db_name})
 
     # 7. 开始生成
     print_title("开始生成数据")
@@ -984,7 +1015,8 @@ def interactive_main():
     elif output_mode == "sql":
         export_to_sql(shipments, items, output_dir)
     elif output_mode == "db":
-        insert_to_mysql(shipments, items, db_host, db_port, db_user, db_pass, db_name)
+        insert_to_mysql(shipments, items, db_host, db_port, db_user, db_pass, db_name,
+                        truncate=db_truncate, create_table=db_create_table, dry_run=db_dry_run)
 
     print("\n🎉 完成！")
 
@@ -1011,19 +1043,36 @@ def interactive_main_with_template(args, template):
     print("  3. 直连 MySQL 写入")
     output_choice = input_with_default("  请选择", "1")
 
+    db_create_table = False
+    db_truncate = False
+    db_dry_run = False
+
     if output_choice == "1":
         output_mode = "csv"
-        output_dir = input_with_default("  输出目录", "./output")
+        output_dir = input_with_default("  输出目录", "./data")
     elif output_choice == "2":
         output_mode = "sql"
-        output_dir = input_with_default("  SQL 文件路径", "./insert_data.sql")
+        output_dir = input_with_default("  SQL 文件路径", "./data/insert_data.sql")
     else:
         output_mode = "db"
-        db_host = input_with_default("  MySQL 主机", "127.0.0.1")
-        db_port = int(input_with_default("  MySQL 端口", "3306"))
-        db_user = input_with_default("  MySQL 用户", "root")
+        # 尝试加载已保存的数据库配置
+        saved_cfg = load_db_config()
+        default_host = saved_cfg["host"]
+        default_port = str(saved_cfg["port"])
+        default_user = saved_cfg["user"]
+        default_db = saved_cfg["database"]
+
+        db_host = input_with_default("  MySQL 主机", default_host)
+        db_port = int(input_with_default("  MySQL 端口", default_port))
+        db_user = input_with_default("  MySQL 用户", default_user)
         db_pass = input("  MySQL 密码: ").strip()
-        db_name = input_with_default("  数据库名", "test")
+        db_name = input_with_default("  数据库名", default_db)
+
+        # 数据库操作选项
+        if yes_no("  是否自动创建表（IF NOT EXISTS）?", "y"):
+            db_create_table = True
+        if yes_no("  是否清空已有数据?", "n"):
+            db_truncate = True
 
     # 生成
     print_title("开始生成数据")
@@ -1048,7 +1097,8 @@ def interactive_main_with_template(args, template):
     elif output_mode == "sql":
         export_to_sql(shipments, items, output_dir)
     elif output_mode == "db":
-        insert_to_mysql(shipments, items, db_host, db_port, db_user, db_pass, db_name)
+        insert_to_mysql(shipments, items, db_host, db_port, db_user, db_pass, db_name,
+                        truncate=db_truncate, create_table=db_create_table, dry_run=db_dry_run)
 
     print("\n🎉 完成！")
 
@@ -1082,27 +1132,56 @@ def load_template(name):
 
 
 def list_templates():
-    """列出所有模板"""
-    if not os.path.exists(TEMPLATE_DIR):
-        return []
+    """列出所有模板（JSON + Excel）"""
     templates = []
-    for f in os.listdir(TEMPLATE_DIR):
-        if f.endswith('.json'):
-            filepath = os.path.join(TEMPLATE_DIR, f)
-            with open(filepath, 'r', encoding='utf-8') as fp:
-                data = json.load(fp)
-            templates.append({
-                "name": data.get("name", f[:-5]),
-                "created_at": data.get("created_at", "未知"),
-                "filepath": filepath,
-                "format": "json",
-            })
+
+    # JSON 模板
+    if os.path.exists(TEMPLATE_DIR):
+        for f in os.listdir(TEMPLATE_DIR):
+            if f.endswith('.json'):
+                filepath = os.path.join(TEMPLATE_DIR, f)
+                with open(filepath, 'r', encoding='utf-8') as fp:
+                    data = json.load(fp)
+                templates.append({
+                    "name": data.get("name", f[:-5]),
+                    "created_at": data.get("created_at", "未知"),
+                    "filepath": filepath,
+                    "format": "json",
+                })
+
+    # Excel 模板
+    templates.extend(list_excel_templates())
+
     return templates
 
 
 # ============================================================
 # Excel 模板管理
 # ============================================================
+
+def _resolve_excel_template_path(name):
+    """
+    解析 Excel 模板路径：
+    - 如果是完整路径且文件存在，直接返回
+    - 否则自动到 excel_templates/ 目录下查找
+    """
+    # 已经是完整路径
+    if os.path.exists(name):
+        return name
+
+    # 在 excel_templates 目录下查找
+    candidates = [
+        os.path.join(EXCEL_TEMPLATE_DIR, name),
+        os.path.join(EXCEL_TEMPLATE_DIR, name + '.xlsx'),
+        os.path.join(EXCEL_TEMPLATE_DIR, name + '.xls'),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    # 都找不到，返回原始路径（让 load_template_excel 报错）
+    return name
+
 
 def _get_field_choices_str(fdef):
     """获取字段可选值的描述字符串"""
@@ -1114,7 +1193,56 @@ def _get_field_choices_str(fdef):
     return ""
 
 
-def export_template_excel(output_path="template_config.xlsx"):
+def list_excel_templates():
+    """列出 excel_templates 目录下的所有 Excel 模板"""
+    os.makedirs(EXCEL_TEMPLATE_DIR, exist_ok=True)
+    templates = []
+    for f in sorted(os.listdir(EXCEL_TEMPLATE_DIR)):
+        if f.endswith(('.xlsx', '.xls')):
+            filepath = os.path.join(EXCEL_TEMPLATE_DIR, f)
+            mtime = os.path.getmtime(filepath)
+            created_at = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+            templates.append({
+                "name": f,
+                "filepath": filepath,
+                "created_at": created_at,
+                "format": "excel",
+            })
+    return templates
+
+
+def _interactive_pick_excel_template():
+    """交互式选择 excel_templates 目录下的 Excel 模板"""
+    templates = list_excel_templates()
+    if not templates:
+        print("\n  ⚠️  excel_templates 目录下没有 Excel 模板文件")
+        if yes_no("  是否现在导出一个空白模板？", "y"):
+            os.makedirs(EXCEL_TEMPLATE_DIR, exist_ok=True)
+            default_path = os.path.join(EXCEL_TEMPLATE_DIR, "template_config.xlsx")
+            export_template_excel(default_path)
+            print(f"  请编辑 {default_path} 后重新运行")
+        return None
+
+    print("\n  excel_templates 目录下的 Excel 模板：")
+    for i, t in enumerate(templates, 1):
+        print(f"    {i}. {t['name']}  (修改于 {t['created_at']})")
+
+    choice = input_with_default("  请选择模板编号", "1")
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(templates):
+            selected = templates[idx]
+            template = load_template_excel(selected['filepath'])
+            return template
+        else:
+            print(f"  ❌ 无效选择")
+            return None
+    except ValueError:
+        print(f"  ❌ 无效输入")
+        return None
+
+
+def export_template_excel(output_path=None):
     """
     导出空白 Excel 配置模板，用户可在 Excel 中编辑后使用
 
@@ -1126,6 +1254,11 @@ def export_template_excel(output_path="template_config.xlsx"):
     if not HAS_OPENPYXL:
         print("缺少 openpyxl 库，请执行: pip install openpyxl")
         sys.exit(1)
+
+    # 默认保存到 excel_templates 目录
+    if output_path is None:
+        os.makedirs(EXCEL_TEMPLATE_DIR, exist_ok=True)
+        output_path = os.path.join(EXCEL_TEMPLATE_DIR, "template_config.xlsx")
 
     wb = openpyxl.Workbook()
 
@@ -1251,7 +1384,7 @@ def export_template_excel(output_path="template_config.xlsx"):
         ["", ""],
         ["使用方式:", ""],
         ["1. 编辑此 Excel 文件中的配置"],
-        ["2. 保存后执行: python generate_inbound_data.py --template-excel template_config.xlsx --count 50 --output csv"],
+        ["2. 保存后执行: python generate_inbound_data.py --template-excel excel_templates/template_config.xlsx --count 50 --output csv"],
     ]
     for i, row in enumerate(instructions, 1):
         for j, val in enumerate(row, 1):
@@ -1376,7 +1509,7 @@ def save_template_excel(filepath, shipment_config, item_config):
             ws.column_dimensions[openpyxl.utils.get_column_letter(idx)].width = w
 
     write_sheet(wb.active, "货件主表", SHIPMENT_FIELDS, shipment_config, "4472C4")
-    write_sheet(wb.create_sheet("货件明细"), ITEM_FIELDS, item_config, "548235")
+    write_sheet(wb.create_sheet("货件明细"), "货件明细", ITEM_FIELDS, item_config, "548235")
 
     wb.save(filepath)
     print(f"  ✅ Excel 模板已保存: {filepath}")
@@ -1467,20 +1600,340 @@ def _sql_value(value):
         return f"'{escaped}'"
 
 
-def insert_to_mysql(shipments, items, host, port, user, password, database, batch_size=500):
+# ============================================================
+# 数据库配置管理
+# ============================================================
+
+# 数据库配置文件路径（与脚本同目录）
+DB_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_config.json")
+
+# MySQL 字段类型映射：根据字段定义自动推导 SQL 列类型
+_MYSQL_TYPE_MAP = {
+    "string": "VARCHAR(255)",
+    "choice": "VARCHAR(50)",
+    "int": "INT",
+    "float": "DECIMAL(12,2)",
+    "datetime": "DATETIME",
+    "inherit": "VARCHAR(255)",  # 继承字段类型由源字段决定，此处用通用类型
+}
+
+
+def load_db_config(config_file=None):
+    """
+    从 db_config.json 加载数据库连接配置。
+    配置文件格式：
+    {
+        "host": "127.0.0.1",
+        "port": 3306,
+        "user": "root",
+        "password": "your_password",
+        "database": "test"
+    }
+
+    也支持从环境变量读取（优先级更高）：
+        DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_DATABASE
+    """
+    config = {
+        "host": os.environ.get("DB_HOST", "127.0.0.1"),
+        "port": int(os.environ.get("DB_PORT", "3306")),
+        "user": os.environ.get("DB_USER", "root"),
+        "password": os.environ.get("DB_PASSWORD", ""),
+        "database": os.environ.get("DB_DATABASE", "test"),
+    }
+
+    # 从配置文件读取（环境变量未设置时作为默认值）
+    cfg_path = config_file or DB_CONFIG_FILE
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                file_config = json.load(f)
+            # 环境变量优先，配置文件补缺
+            for key in ("host", "port", "user", "password", "database"):
+                if key in file_config:
+                    # 环境变量未设置时才用文件中的值
+                    env_key = f"DB_{key.upper()}"
+                    if env_key not in os.environ:
+                        config[key] = file_config[key]
+            print(f"  📂 已加载数据库配置: {cfg_path}")
+        except Exception as e:
+            print(f"  ⚠️  读取数据库配置文件失败: {e}，使用默认值")
+    else:
+        if config_file:
+            print(f"  ⚠️  指定的配置文件不存在: {cfg_path}")
+
+    # 确保 port 是整数
+    config["port"] = int(config["port"])
+    return config
+
+
+def save_db_config(config, config_file=None):
+    """保存数据库连接配置到 db_config.json"""
+    cfg_path = config_file or DB_CONFIG_FILE
+    try:
+        with open(cfg_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        print(f"  ✅ 数据库配置已保存: {cfg_path}")
+        print(f"     ⚠️  配置文件包含密码，请勿提交到版本控制！建议在 .gitignore 中添加 db_config.json")
+    except Exception as e:
+        print(f"  ❌ 保存配置文件失败: {e}")
+
+
+def test_mysql_connection(host, port, user, password, database):
+    """测试 MySQL 数据库连接是否可用"""
+    try:
+        import pymysql
+    except ImportError:
+        print("❌ 缺少 pymysql，请执行: pip install pymysql")
+        return False
+
+    try:
+        conn = pymysql.connect(
+            host=host, port=port, user=user,
+            password=password, database=database,
+            charset='utf8mb4', connect_timeout=10,
+        )
+        cursor = conn.cursor()
+        cursor.execute("SELECT VERSION()")
+        version = cursor.fetchone()[0]
+        cursor.close()
+        conn.close()
+        print(f"  ✅ 数据库连接成功！MySQL 版本: {version}")
+        return True
+    except Exception as e:
+        print(f"  ❌ 数据库连接失败: {e}")
+        return False
+
+
+def generate_create_table_ddl(table_name, fields_def, if_not_exists=True):
+    """
+    根据字段定义自动生成 CREATE TABLE 语句。
+
+    Args:
+        table_name: 表名
+        fields_def: 字段定义字典 (SHIPMENT_FIELDS / ITEM_FIELDS)
+        if_not_exists: 是否添加 IF NOT EXISTS
+
+    Returns:
+        str: CREATE TABLE DDL 语句
+    """
+    exists_clause = "IF NOT EXISTS " if if_not_exists else ""
+    lines = []
+
+    for fname, fdef in fields_def.items():
+        ftype = fdef.get("type", "string")
+        mysql_type = _MYSQL_TYPE_MAP.get(ftype, "VARCHAR(255)")
+
+        # 继承字段根据源字段类型推导
+        if ftype == "inherit":
+            inherit_from = fdef.get("inherit_from", "shipment")
+            if inherit_from == "shipment" and fname in SHIPMENT_FIELDS:
+                source_type = SHIPMENT_FIELDS[fname].get("type", "string")
+                mysql_type = _MYSQL_TYPE_MAP.get(source_type, "VARCHAR(255)")
+
+        nullable = fdef.get("nullable", False)
+        required = fdef.get("required", False)
+
+        if required:
+            null_clause = " NOT NULL"
+        elif nullable:
+            null_clause = ""
+        else:
+            null_clause = ""
+
+        default_clause = ""
+        if nullable and not required:
+            default_clause = " DEFAULT NULL"
+
+        lines.append(f"  `{fname}` {mysql_type}{null_clause}{default_clause}")
+
+    # 主键：使用 SHIPMENT_ID 作为货件主表主键
+    if table_name == "mws_fi_data_inbound_shipment":
+        lines.append(f"  PRIMARY KEY (`SHIPMENT_ID`)")
+    elif table_name == "mws_fi_data_inbound_shipment_item":
+        # 明细表使用联合主键
+        lines.append(f"  PRIMARY KEY (`SHIPMENT_ID`, `SELLER_SKU`)")
+
+    columns_sql = ",\n".join(lines)
+    ddl = f"CREATE TABLE {exists_clause}`{table_name}` (\n{columns_sql}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+    return ddl
+
+
+def create_tables_if_needed(host, port, user, password, database):
+    """自动创建目标表（如果不存在）"""
+    try:
+        import pymysql
+    except ImportError:
+        print("❌ 缺少 pymysql，请执行: pip install pymysql")
+        return False
+
+    try:
+        conn = pymysql.connect(
+            host=host, port=port, user=user,
+            password=password, database=database, charset='utf8mb4',
+        )
+        cursor = conn.cursor()
+
+        # 货件主表
+        ddl1 = generate_create_table_ddl("mws_fi_data_inbound_shipment", SHIPMENT_FIELDS)
+        print(f"\n📦 创建货件主表...")
+        print(f"  执行 DDL:\n{ddl1}\n")
+        cursor.execute(ddl1)
+        print(f"  ✅ 货件主表已就绪")
+
+        # 明细表
+        ddl2 = generate_create_table_ddl("mws_fi_data_inbound_shipment_item", ITEM_FIELDS)
+        print(f"\n📋 创建明细表...")
+        print(f"  执行 DDL:\n{ddl2}\n")
+        cursor.execute(ddl2)
+        print(f"  ✅ 明细表已就绪")
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"  ❌ 创建表失败: {e}")
+        return False
+
+
+def truncate_tables(host, port, user, password, database):
+    """清空目标表数据（保留表结构）"""
+    try:
+        import pymysql
+    except ImportError:
+        print("❌ 缺少 pymysql，请执行: pip install pymysql")
+        return False
+
+    try:
+        conn = pymysql.connect(
+            host=host, port=port, user=user,
+            password=password, database=database, charset='utf8mb4',
+        )
+        cursor = conn.cursor()
+
+        # 先删除明细表（外键依赖），再删除主表
+        print(f"\n🗑️  清空明细表...")
+        cursor.execute("TRUNCATE TABLE `mws_fi_data_inbound_shipment_item`")
+        print(f"  ✅ 明细表已清空")
+
+        print(f"\n🗑️  清空货件主表...")
+        cursor.execute("TRUNCATE TABLE `mws_fi_data_inbound_shipment`")
+        print(f"  ✅ 货件主表已清空")
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"  ❌ 清空表失败: {e}")
+        return False
+
+
+def insert_to_mysql(shipments, items, host, port, user, password, database,
+                    batch_size=500, truncate=False, create_table=False,
+                    dry_run=False, retry_count=3, retry_delay=2):
+    """
+    将生成的数据写入 MySQL 数据库。
+
+    Args:
+        shipments: 货件主表数据列表
+        items: 明细表数据列表
+        host/port/user/password/database: 数据库连接参数
+        batch_size: 每批提交的行数
+        truncate: 是否在插入前清空表
+        create_table: 是否自动建表
+        dry_run: 仅打印 SQL 不实际执行
+        retry_count: 连接失败重试次数
+        retry_delay: 重试间隔（秒）
+    """
     try:
         import pymysql
     except ImportError:
         print("❌ 缺少 pymysql，请执行: pip install pymysql")
         sys.exit(1)
 
-    conn = pymysql.connect(
-        host=host, port=port, user=user,
-        password=password, database=database, charset='utf8mb4',
-    )
+    # 连接测试（带重试）
+    conn = None
+    last_error = None
+    for attempt in range(1, retry_count + 1):
+        try:
+            conn = pymysql.connect(
+                host=host, port=port, user=user,
+                password=password, database=database,
+                charset='utf8mb4', connect_timeout=10,
+            )
+            break
+        except Exception as e:
+            last_error = e
+            if attempt < retry_count:
+                print(f"  ⚠️  连接失败（第 {attempt}/{retry_count} 次），{retry_delay}秒后重试...")
+                time.sleep(retry_delay)
+            else:
+                print(f"  ❌ 连接失败，已重试 {retry_count} 次: {last_error}")
+                sys.exit(1)
 
     try:
         cursor = conn.cursor()
+
+        # 测试连接
+        cursor.execute("SELECT VERSION()")
+        version = cursor.fetchone()[0]
+        print(f"\n🔌 已连接 MySQL {version} @ {host}:{port}/{database}")
+
+        # 自动建表
+        if create_table:
+            ddl1 = generate_create_table_ddl("mws_fi_data_inbound_shipment", SHIPMENT_FIELDS)
+            ddl2 = generate_create_table_ddl("mws_fi_data_inbound_shipment_item", ITEM_FIELDS)
+            if dry_run:
+                print(f"\n[DRY-RUN] 将执行以下建表语句:")
+                print(f"\n--- 货件主表 DDL ---\n{ddl1}\n")
+                print(f"--- 明细表 DDL ---\n{ddl2}\n")
+            else:
+                print(f"\n📦 自动建表...")
+                cursor.execute(ddl1)
+                print(f"  ✅ 货件主表已就绪")
+                cursor.execute(ddl2)
+                print(f"  ✅ 明细表已就绪")
+                conn.commit()
+
+        # 清空表
+        if truncate:
+            if dry_run:
+                print(f"\n[DRY-RUN] 将执行以下清空操作:")
+                print(f"  TRUNCATE TABLE `mws_fi_data_inbound_shipment_item`")
+                print(f"  TRUNCATE TABLE `mws_fi_data_inbound_shipment`")
+            else:
+                print(f"\n🗑️  清空目标表...")
+                cursor.execute("TRUNCATE TABLE `mws_fi_data_inbound_shipment_item`")
+                cursor.execute("TRUNCATE TABLE `mws_fi_data_inbound_shipment`")
+                conn.commit()
+                print(f"  ✅ 表已清空")
+
+        # dry-run 模式：打印前几条 INSERT 语句
+        if dry_run:
+            print(f"\n[DRY-RUN] 将执行以下 INSERT 语句（仅展示前3条）:")
+            if shipments:
+                print(f"\n--- 货件主表（共 {len(shipments)} 条）---")
+                for s in shipments[:3]:
+                    cols_vals = [(k, v) for k, v in s.items() if v is not None]
+                    if cols_vals:
+                        cols = ', '.join(k for k, _ in cols_vals)
+                        vals = ', '.join(_sql_value(v) for _, v in cols_vals)
+                        print(f"  INSERT INTO `mws_fi_data_inbound_shipment` ({cols}) VALUES ({vals});")
+                if len(shipments) > 3:
+                    print(f"  ... 省略 {len(shipments) - 3} 条")
+            if items:
+                print(f"\n--- 明细表（共 {len(items)} 条）---")
+                for item in items[:3]:
+                    cols_vals = [(k, v) for k, v in item.items() if v is not None]
+                    if cols_vals:
+                        cols = ', '.join(k for k, _ in cols_vals)
+                        vals = ', '.join(_sql_value(v) for _, v in cols_vals)
+                        print(f"  INSERT INTO `mws_fi_data_inbound_shipment_item` ({cols}) VALUES ({vals});")
+                if len(items) > 3:
+                    print(f"  ... 省略 {len(items) - 3} 条")
+            print(f"\n[DRY-RUN] 模式结束，未实际写入数据。")
+            return
 
         # 动态构建 INSERT
         if shipments:
@@ -1497,7 +1950,7 @@ def insert_to_mysql(shipments, items, host, port, user, password, database, batc
                     conn.commit()
                     print(f"  已插入 {i + 1}/{len(shipments)} 条")
             conn.commit()
-            print(f"  货件主表完成: {len(shipments)} 条")
+            print(f"  ✅ 货件主表完成: {len(shipments)} 条")
 
         if items:
             print(f"\n📋 插入货件明细...")
@@ -1513,17 +1966,20 @@ def insert_to_mysql(shipments, items, host, port, user, password, database, batc
                     conn.commit()
                     print(f"  已插入 {i + 1}/{len(items)} 条")
             conn.commit()
-            print(f"  明细表完成: {len(items)} 条")
+            print(f"  ✅ 明细表完成: {len(items)} 条")
 
         print(f"\n✅ 数据写入完成！")
 
     except Exception as e:
-        conn.rollback()
+        if conn:
+            conn.rollback()
         print(f"❌ 写入失败: {e}")
         raise
     finally:
-        cursor.close()
-        conn.close()
+        if cursor:
+            cursor.close()
+        if conn:
+            conn.close()
 
 
 # ============================================================
@@ -1580,11 +2036,23 @@ def cli_main_with_config(args, shipment_config, item_config):
     elif args.output == 'sql':
         export_to_sql(shipments, items, args.sql_file)
     elif args.output == 'db':
+        # 加载数据库配置（合并命令行参数和配置文件）
+        db_cfg = load_db_config(getattr(args, 'db_config', None))
+        # 命令行参数优先（仅当用户明确提供时覆盖）
+        db_host = args.host if args._host_explicit else db_cfg["host"]
+        db_port = args.port if args._port_explicit else db_cfg["port"]
+        db_user = args.user if args._user_explicit else db_cfg["user"]
+        db_pass = args.password if args._password_explicit else db_cfg["password"]
+        db_name = args.database if args._database_explicit else db_cfg["database"]
+
         insert_to_mysql(
             shipments, items,
-            host=args.host, port=args.port,
-            user=args.user, password=args.password,
-            database=args.database,
+            host=db_host, port=db_port,
+            user=db_user, password=db_pass,
+            database=db_name,
+            truncate=args.truncate,
+            create_table=args.create_table,
+            dry_run=args.dry_run,
         )
 
     print("\n🎉 完成！")
@@ -1630,15 +2098,84 @@ def main():
     parser.add_argument('--seed', type=int, default=None, help='随机种子')
     parser.add_argument('--output', choices=['csv', 'db', 'sql'], default=None,
                         help='输出方式（指定后跳过交互式，直接快速生成）')
-    parser.add_argument('--output-dir', type=str, default='./output')
-    parser.add_argument('--sql-file', type=str, default='./insert_data.sql')
-    parser.add_argument('--host', type=str, default='127.0.0.1')
-    parser.add_argument('--port', type=int, default=3306)
-    parser.add_argument('--user', type=str, default='root')
-    parser.add_argument('--password', type=str, default='')
-    parser.add_argument('--database', type=str, default='test')
+    parser.add_argument('--output-dir', type=str, default='./data')
+    parser.add_argument('--sql-file', type=str, default='./data/insert_data.sql')
+    # 数据库连接参数（命令行优先，其次 db_config.json，再其次环境变量）
+    parser.add_argument('--host', type=str, default=None)
+    parser.add_argument('--port', type=int, default=None)
+    parser.add_argument('--user', type=str, default=None)
+    parser.add_argument('--password', type=str, default=None)
+    parser.add_argument('--database', type=str, default=None)
+    parser.add_argument('--db-config', type=str, default=None,
+                        help='数据库配置文件路径（默认: 脚本同目录/db_config.json）')
+
+    # 数据库操作选项
+    parser.add_argument('--truncate', action='store_true',
+                        help='插入数据前清空目标表')
+    parser.add_argument('--create-table', action='store_true',
+                        help='自动创建目标表（IF NOT EXISTS）')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='仅展示将要执行的 SQL 语句，不实际写入')
+    parser.add_argument('--test-conn', action='store_true',
+                        help='测试数据库连接是否可用')
+    parser.add_argument('--export-ddl', action='store_true',
+                        help='导出建表 DDL 到 SQL 文件')
 
     args = parser.parse_args()
+
+    # 标记哪些数据库参数是用户明确指定的（用于优先级判断）
+    args._host_explicit = args.host is not None
+    args._port_explicit = args.port is not None
+    args._user_explicit = args.user is not None
+    args._password_explicit = args.password is not None
+    args._database_explicit = args.database is not None
+
+    # 填充默认值（后续会与 db_config.json 合并）
+    args.host = args.host or '127.0.0.1'
+    args.port = args.port or 3306
+    args.user = args.user or 'root'
+    args.password = args.password or ''
+    args.database = args.database or 'test'
+
+    # 测试数据库连接
+    if args.test_conn:
+        db_cfg = load_db_config(args.db_config)
+        # 命令行参数覆盖
+        host = args.host if args._host_explicit else db_cfg["host"]
+        port = args.port if args._port_explicit else db_cfg["port"]
+        user = args.user if args._user_explicit else db_cfg["user"]
+        password = args.password if args._password_explicit else db_cfg["password"]
+        database = args.database if args._database_explicit else db_cfg["database"]
+        print_separator()
+        print("  🔌 测试数据库连接")
+        print_separator()
+        print(f"  主机: {host}:{port}")
+        print(f"  用户: {user}")
+        print(f"  数据库: {database}")
+        test_mysql_connection(host, port, user, password, database)
+        return
+
+    # 导出建表 DDL
+    if args.export_ddl:
+        ddl1 = generate_create_table_ddl("mws_fi_data_inbound_shipment", SHIPMENT_FIELDS)
+        ddl2 = generate_create_table_ddl("mws_fi_data_inbound_shipment_item", ITEM_FIELDS)
+        ddl_file = args.sql_file or './data/create_tables.sql'
+        dir_path = os.path.dirname(ddl_file)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
+        with open(ddl_file, 'w', encoding='utf-8') as f:
+            f.write("-- 亚马逊 FBA 入库货件表结构 DDL\n")
+            f.write(f"-- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("-- 货件主表\n")
+            f.write(ddl1 + "\n\n")
+            f.write("-- 货件明细表\n")
+            f.write(ddl2 + "\n")
+        print(f"✅ DDL 文件已导出: {ddl_file}")
+        print(f"\n--- DDL 内容 ---")
+        print(ddl1)
+        print()
+        print(ddl2)
+        return
 
     # 列出模板
     if args.list_templates:
@@ -1646,22 +2183,35 @@ def main():
         if templates:
             print("已保存的配置模板:")
             for t in templates:
-                print(f"  📄 {t['name']}  ({t['format']}) 创建于 {t['created_at']}")
+                icon = "📊" if t.get("format") == "excel" else "📄"
+                fmt_label = "Excel" if t.get("format") == "excel" else "JSON"
+                print(f"  {icon} {t['name']}  ({fmt_label})  修改于 {t['created_at']}")
         else:
             print("暂无已保存的模板。")
+            print("  提示: 运行 --export-excel-template 可生成 Excel 模板到 excel_templates/ 目录")
         return
 
     # 导出 Excel 模板
     if args.export_excel_template:
-        output_path = args.output_dir if args.output_dir != './output' else 'template_config.xlsx'
+        output_path = None  # 默认保存到 excel_templates/
         export_template_excel(output_path)
         return
 
     # 指定了 --output 则走快速模式
+    # 使用 db 模式时，自动保存数据库配置（首次使用提示）
+    if args.output == 'db' and not os.path.exists(DB_CONFIG_FILE) and not args.db_config:
+        print(f"\n💡 提示: 可以通过 db_config.json 保存数据库连接配置，避免每次输入。")
+        print(f"   配置文件路径: {DB_CONFIG_FILE}")
+        print(f"   格式: {{\"host\": \"127.0.0.1\", \"port\": 3306, \"user\": \"root\", \"password\": \"xxx\", \"database\": \"test\"}}")
+        if yes_no("  是否保存当前数据库配置?", "n"):
+            db_cfg = load_db_config(args.db_config)
+            save_db_config(db_cfg)
+
     if args.output:
         # 如果同时指定了 Excel 模板
         if args.template_excel:
-            template = load_template_excel(args.template_excel)
+            excel_path = _resolve_excel_template_path(args.template_excel)
+            template = load_template_excel(excel_path)
             if not template:
                 sys.exit(1)
             shipment_config = template.get("shipment", {})
@@ -1676,7 +2226,8 @@ def main():
     # 否则走交互式
     if args.template_excel:
         # 使用 Excel 模板 + 交互式输入数量和输出方式
-        template = load_template_excel(args.template_excel)
+        excel_path = _resolve_excel_template_path(args.template_excel)
+        template = load_template_excel(excel_path)
         if template:
             interactive_main_with_template(args, template)
         else:
